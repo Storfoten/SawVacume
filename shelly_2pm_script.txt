@@ -1,0 +1,185 @@
+// Shelly 2PM Gen3 - Saw / Vacuum controller
+//
+// Output 0 = Saw
+//   - Always ON
+//   - Power consumption is monitored
+//
+// Output 1 = Vacuum
+//   - ON  when Output 0 > threshold continuously for TURN_ON_DELAY_MS
+//   - OFF when Output 0 < threshold continuously for TURN_OFF_DELAY_MS
+//
+// If the threshold is crossed again while waiting,
+// the pending action is cancelled.
+//
+// Default:
+//   Saw > 300 W for 1 second  -> Vacuum ON
+//   Saw < 300 W for 30 seconds -> Vacuum OFF
+
+let THRESHOLD_W = 300;
+
+let TURN_ON_DELAY_MS  = 1000;   // 1 second
+let TURN_OFF_DELAY_MS = 30000;  // 30 seconds
+
+let CHECK_INTERVAL_MS = 200;
+
+let pendingState = null;
+let pendingTimer = null;
+
+
+// ------------------------------------------------------------
+// Set output only if it actually needs changing
+// ------------------------------------------------------------
+
+function setOutput(id, state) {
+  let status = Shelly.getComponentStatus("switch", id);
+
+  if (status === null) {
+    print("Could not read switch:", id);
+    return;
+  }
+
+  if (status.output === state) {
+    return;
+  }
+
+  print("Setting output", id, state ? "ON" : "OFF");
+
+  Shelly.call("Switch.Set", {
+    id: id,
+    on: state
+  });
+}
+
+
+// ------------------------------------------------------------
+// Cancel pending transition
+// ------------------------------------------------------------
+
+function cancelPending() {
+  if (pendingTimer !== null) {
+    Timer.clear(pendingTimer);
+    pendingTimer = null;
+  }
+
+  pendingState = null;
+}
+
+
+// ------------------------------------------------------------
+// Start ON or OFF delay
+// ------------------------------------------------------------
+
+function startPending(desiredState) {
+
+  // We're already waiting for this transition
+  if (pendingState === desiredState) {
+    return;
+  }
+
+  cancelPending();
+
+  pendingState = desiredState;
+
+  let delay = desiredState
+    ? TURN_ON_DELAY_MS
+    : TURN_OFF_DELAY_MS;
+
+  print(
+    desiredState ? "ON" : "OFF",
+    "condition detected. Waiting",
+    delay,
+    "ms"
+  );
+
+  pendingTimer = Timer.set(delay, false, function () {
+
+    pendingTimer = null;
+
+    let master = Shelly.getComponentStatus("switch", 0);
+
+    if (master === null || master.apower === undefined) {
+      pendingState = null;
+      return;
+    }
+
+    let desiredNow = master.apower > THRESHOLD_W;
+
+    // Only switch if the power is STILL on the same
+    // side of the threshold after the complete delay.
+    if (desiredNow === pendingState) {
+
+      print(
+        "Condition confirmed. Power:",
+        master.apower,
+        "W - setting vacuum",
+        desiredNow ? "ON" : "OFF"
+      );
+
+      setOutput(1, desiredNow);
+    } else {
+      print("Condition changed - no action");
+    }
+
+    pendingState = null;
+  });
+}
+
+
+// ------------------------------------------------------------
+// Main control loop
+// ------------------------------------------------------------
+
+function checkPower() {
+
+  let master = Shelly.getComponentStatus("switch", 0);
+
+  if (master === null) {
+    return;
+  }
+
+
+  // Output 0 (saw) must always have power
+  if (master.output !== true) {
+    print("Saw output was OFF - turning it back ON");
+    setOutput(0, true);
+    return;
+  }
+
+
+  if (master.apower === undefined) {
+    return;
+  }
+
+
+  // Determine what state the vacuum should eventually have
+  let desiredState = master.apower > THRESHOLD_W;
+
+  let vacuum = Shelly.getComponentStatus("switch", 1);
+
+  if (vacuum === null) {
+    return;
+  }
+
+
+  // Vacuum is already in the desired state.
+  // Cancel any pending transition.
+  if (vacuum.output === desiredState) {
+    cancelPending();
+    return;
+  }
+
+
+  // Vacuum needs to change state.
+  startPending(desiredState);
+}
+
+
+// ------------------------------------------------------------
+// Startup
+// ------------------------------------------------------------
+
+print("Saw / vacuum controller starting");
+
+setOutput(0, true);
+
+Timer.set(CHECK_INTERVAL_MS, true, checkPower);
